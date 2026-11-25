@@ -1,0 +1,88 @@
+# name: test/sql/read_wide_decimal.test
+# description: Avro decimals of more than 38 digits are read as exact DECIMALs
+# group: [sql]
+
+require avro
+
+# Generated independently of DuckDB's writer by scripts/create_wide_decimal_bytes.py: bytes and fixed decimals,
+# both orders of the nullable union
+query TT
+SELECT column_name, column_type FROM (DESCRIBE FROM read_avro('test/wide_decimal_bytes.avro'));
+----
+row_id	INTEGER
+decimal_39_0	DECIMAL(39,0)
+decimal_76_10	DECIMAL(76,10)
+decimal_255_3	DECIMAL(255,3)
+decimal_300_10	DECIMAL(300,10)
+
+# The unscaled values of the rows of the fixture, the first and the last being the smallest and the largest value of
+# each precision
+statement ok
+CREATE TABLE unscaled AS
+SELECT row_id::INTEGER AS row_id, value::BIGNUM AS value
+FROM (VALUES
+	(2, '-340282366920938463463374607431768211456'), (3, '-65536'), (4, '-65535'), (5, '-256'), (6, '-255'),
+	(7, '-129'), (8, '-128'), (9, '-1'), (10, '0'), (11, '1'), (12, '127'), (13, '128'), (14, '255'), (15, '256'),
+	(16, '65535'), (17, '18446744073709551616'), (18, '170141183460469231731687303715884105728'),
+	(19, '340282366920938463463374607431768211455')
+) t(row_id, value);
+
+query IIIII
+SELECT row_id, decimal_39_0, decimal_76_10, decimal_255_3, decimal_300_10
+FROM read_avro('test/wide_decimal_bytes.avro')
+WHERE row_id IN (0, 6, 10, 15)
+ORDER BY row_id;
+----
+0	NULL	NULL	NULL	NULL
+6	-255	-0.0000000255	-0.255	-0.0000000255
+10	0	0.0000000000	0.000	0.0000000000
+15	256	0.0000000256	0.256	0.0000000256
+
+foreach column decimal_39_0 decimal_76_10 decimal_255_3 decimal_300_10
+
+# the digits of every value are those of the unscaled value
+query I
+SELECT count(*)
+FROM read_avro('test/wide_decimal_bytes.avro') JOIN unscaled USING (row_id)
+WHERE replace({column}::VARCHAR, '.', '')::BIGNUM = value;
+----
+18
+
+# the smallest and the largest value have as many nines as the precision
+query II
+SELECT replace(max({column})::VARCHAR, '.', '') =
+       repeat('9', regexp_extract(typeof(max({column})), '([0-9]+),', 1)::INTEGER),
+       min({column}) = -max({column})
+FROM read_avro('test/wide_decimal_bytes.avro');
+----
+true	true
+
+endloop
+
+# a value with more digits than the precision of its column is an error, not a wrong value
+statement error
+FROM read_avro('test/wide_decimal_overflow.avro');
+----
+Avro decimal value does not fit in DECIMAL(39,0)
+
+statement error
+FROM read_avro('test/decimal_zero_precision.avro');
+----
+Invalid Avro decimal with precision 0 and scale 0
+
+# a precision above the widest DECIMAL of the session is a clear error
+statement ok
+SET max_decimal_width = 38;
+
+statement error
+FROM read_avro('test/wide_decimal_bytes.avro');
+----
+DECIMAL type width 39 exceeds the maximum DECIMAL width of 38
+
+statement ok
+SET max_decimal_width = 100;
+
+statement error
+FROM read_avro('test/wide_decimal_bytes.avro');
+----
+DECIMAL type width 255 exceeds the maximum DECIMAL width of 100

@@ -6,13 +6,46 @@ namespace duckdb {
 
 namespace avro {
 
+uint64_t BitsRequiredForDecimal(uint32_t precision) {
+	// log2(10) is 3 + LOG2_10_FRACTION / 2^64. The product with the precision is never close enough to an integer
+	// for the 64 bits of the fraction to matter, so one more than its integer part is the exact ceiling.
+	static constexpr uint64_t LOG2_10_FRACTION = 5938525176524057593ULL;
+	uint64_t fraction_high = LOG2_10_FRACTION >> 32;
+	uint64_t fraction_low = LOG2_10_FRACTION & 0xFFFFFFFFULL;
+	uint64_t product = precision * fraction_high + ((precision * fraction_low) >> 32);
+	return 3ULL * precision + (product >> 32) + 1;
+}
+
+uint32_t MinBytesRequiredForDecimal(uint32_t precision) {
+	// the bits of the largest value, the sign bit, rounded up to bytes
+	return static_cast<uint32_t>((BitsRequiredForDecimal(precision) + 1 + 7) / 8);
+}
+
 namespace {
 
 struct AvroLogicalType {
 	LogicalTypeId id = LogicalTypeId::INVALID;
-	uint8_t width = 0;
-	uint8_t scale = 0;
+	uint32_t width = 0;
+	uint32_t scale = 0;
 };
+
+//! Avro puts no limit on the precision of a decimal: any precision is read as a DECIMAL of that width, and DuckDB
+//! rejects the widths it does not support when the type is created
+void ReadDecimalParameters(avro_schema_t avro_schema, AvroLogicalType &result) {
+	auto precision = avro_schema_precision(avro_schema);
+	auto scale = avro_schema_scale(avro_schema);
+	if (scale == -1) {
+		// the scale is optional and defaults to zero
+		scale = 0;
+	}
+	if (precision < 1 || scale < 0 || scale > precision) {
+		throw InvalidInputError("Invalid Avro decimal with precision " + std::to_string(precision) + " and scale " +
+		                        std::to_string(scale) +
+		                        ": the precision must be positive and the scale between zero and the precision");
+	}
+	result.width = static_cast<uint32_t>(precision);
+	result.scale = static_cast<uint32_t>(scale);
+}
 
 AvroLogicalType AvroLogicalTypeToLogicalType(avro_schema_t avro_schema) {
 	AvroLogicalType result;
@@ -35,8 +68,7 @@ AvroLogicalType AvroLogicalTypeToLogicalType(avro_schema_t avro_schema) {
 		result.id = LogicalTypeId::DATE;
 	} else if (logical_type == "decimal") {
 		result.id = LogicalTypeId::DECIMAL;
-		result.width = static_cast<uint8_t>(avro_schema_precision(avro_schema));
-		result.scale = static_cast<uint8_t>(avro_schema_scale(avro_schema));
+		ReadDecimalParameters(avro_schema, result);
 	} else if (logical_type == "time-micros" || logical_type == "time-millis") {
 		result.id = LogicalTypeId::TIME;
 	} else if (logical_type == "timestamp-micros" || logical_type == "timestamp-millis") {

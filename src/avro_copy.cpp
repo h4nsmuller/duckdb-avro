@@ -1,4 +1,5 @@
 #include "avro_copy.hpp"
+#include "avro_type.hpp"
 
 #include "field_ids.hpp"
 
@@ -191,55 +192,6 @@ std::string GetTemporalLogicalType(const LogicalType &type) {
 	default:
 		throw NotImplementedError("Can't convert logical type '" + type.ToText() + "' to Avro temporal type");
 	}
-}
-
-uint32_t MinBytesRequiredForDecimal(int32_t precision) {
-	// Number of bits needed: ceil(precision * log2(10)) + 1 (sign bit)
-	// log2(10) ~ 10/3, but more precisely we use the fact that
-	// 10^P requires ceil(P * log2(10)) bits.
-	// Exact bit counts per precision bracket, before the sign bit:
-	static constexpr int32_t BITS_REQUIRED[] = {
-	    0,   // precision 0 (unused)
-	    4,   // 1  -> max 9
-	    7,   // 2  -> max 99
-	    10,  // 3  -> max 999
-	    14,  // 4  -> max 9999
-	    17,  // 5
-	    20,  // 6
-	    24,  // 7
-	    27,  // 8
-	    30,  // 9
-	    34,  // 10
-	    37,  // 11
-	    40,  // 12
-	    44,  // 13
-	    47,  // 14
-	    50,  // 15
-	    54,  // 16
-	    57,  // 17
-	    60,  // 18
-	    64,  // 19
-	    67,  // 20
-	    70,  // 21
-	    74,  // 22
-	    77,  // 23
-	    80,  // 24
-	    84,  // 25
-	    87,  // 26
-	    90,  // 27
-	    94,  // 28
-	    97,  // 29
-	    100, // 30
-	    103, // 31
-	    107, // 32
-	    110, // 33
-	    113, // 34
-	    117, // 35
-	    120, // 36
-	    123, // 37
-	    127, // 38
-	};
-	return (BITS_REQUIRED[precision] + 1 + 7) / 8; // ceil((bits + sign bit) / 8)
 }
 
 bool IsNamedSchema(const LogicalType &type) {
@@ -674,7 +626,7 @@ using writer_ptr_t = std::unique_ptr<AvroColumnWriter>;
 
 //! Writes a DECIMAL as the big-endian two's complement bytes its precision requires
 template <class T>
-idx_t WriteDecimalAsFixedBytes(const T &value, uint8_t *bytes, uint8_t width) {
+idx_t WriteDecimalAsFixedBytes(const T &value, uint8_t *bytes, uint32_t width) {
 	uint64_t upper;
 	uint64_t lower;
 	if constexpr (std::is_same_v<T, cxx::int128_t>) {
@@ -697,10 +649,10 @@ idx_t WriteDecimalAsFixedBytes(const T &value, uint8_t *bytes, uint8_t width) {
 template <class T>
 class PrimitiveAvroColumnWriter : public AvroColumnWriter {
 public:
-	using WriteFunction = idx_t (*)(avro_value_t *, const T &, uint8_t);
+	using WriteFunction = idx_t (*)(avro_value_t *, const T &, uint32_t);
 
 public:
-	PrimitiveAvroColumnWriter(std::string type_name, WriteFunction write_function, uint8_t decimal_width = 0)
+	PrimitiveAvroColumnWriter(std::string type_name, WriteFunction write_function, uint32_t decimal_width = 0)
 	    : AvroColumnWriter(std::move(type_name)), write_function(write_function), decimal_width(decimal_width) {
 	}
 
@@ -718,83 +670,129 @@ public:
 
 private:
 	WriteFunction write_function;
-	uint8_t decimal_width;
+	uint32_t decimal_width;
 	cxx::VectorView view {};
 };
 
-idx_t WriteBooleanValue(avro_value_t *target, const bool &value, uint8_t) {
+idx_t WriteBooleanValue(avro_value_t *target, const bool &value, uint32_t) {
 	avro_value_set_boolean(target, value);
 	return sizeof(bool);
 }
 
-idx_t WriteBlobValue(avro_value_t *target, const cxx::blob_t &value, uint8_t) {
+idx_t WriteBlobValue(avro_value_t *target, const cxx::blob_t &value, uint32_t) {
 	avro_value_set_bytes(target, (void *)value.data(), value.size());
 	return value.size();
 }
 
-idx_t WriteDoubleValue(avro_value_t *target, const double &value, uint8_t) {
+idx_t WriteDoubleValue(avro_value_t *target, const double &value, uint32_t) {
 	avro_value_set_double(target, value);
 	return sizeof(double);
 }
 
-idx_t WriteFloatValue(avro_value_t *target, const float &value, uint8_t) {
+idx_t WriteFloatValue(avro_value_t *target, const float &value, uint32_t) {
 	avro_value_set_float(target, value);
 	return sizeof(float);
 }
 
-idx_t WriteIntegerValue(avro_value_t *target, const int32_t &value, uint8_t) {
+idx_t WriteIntegerValue(avro_value_t *target, const int32_t &value, uint32_t) {
 	avro_value_set_int(target, value);
 	return sizeof(int32_t);
 }
 
-idx_t WriteBigIntValue(avro_value_t *target, const int64_t &value, uint8_t) {
+idx_t WriteBigIntValue(avro_value_t *target, const int64_t &value, uint32_t) {
 	avro_value_set_long(target, value);
 	return sizeof(int64_t);
 }
 
-idx_t WriteStringValue(avro_value_t *target, const cxx::varchar_t &value, uint8_t) {
+idx_t WriteStringValue(avro_value_t *target, const cxx::varchar_t &value, uint32_t) {
 	avro_value_set_string_len(target, value.data(), value.size());
 	return value.size();
 }
 
-idx_t WriteDateValue(avro_value_t *target, const cxx::date_t &value, uint8_t) {
+idx_t WriteDateValue(avro_value_t *target, const cxx::date_t &value, uint32_t) {
 	avro_value_set_int(target, value.days);
 	return sizeof(int32_t);
 }
 
-idx_t WriteTimeValue(avro_value_t *target, const cxx::dtime_t &value, uint8_t) {
+idx_t WriteTimeValue(avro_value_t *target, const cxx::dtime_t &value, uint32_t) {
 	avro_value_set_long(target, value.micros);
 	return sizeof(int64_t);
 }
 
-idx_t WriteTimestampValue(avro_value_t *target, const cxx::timestamp_t &value, uint8_t) {
+idx_t WriteTimestampValue(avro_value_t *target, const cxx::timestamp_t &value, uint32_t) {
 	avro_value_set_long(target, value.micros);
 	return sizeof(int64_t);
 }
 
-idx_t WriteTimestampTZValue(avro_value_t *target, const cxx::timestamp_tz_t &value, uint8_t) {
+idx_t WriteTimestampTZValue(avro_value_t *target, const cxx::timestamp_tz_t &value, uint32_t) {
 	avro_value_set_long(target, value.micros);
 	return sizeof(int64_t);
 }
 
-idx_t WriteTimestampTZNSValue(avro_value_t *target, const cxx::timestamp_tz_ns_t &value, uint8_t) {
+idx_t WriteTimestampTZNSValue(avro_value_t *target, const cxx::timestamp_tz_ns_t &value, uint32_t) {
 	avro_value_set_long(target, value.nanos);
 	return sizeof(int64_t);
 }
 
-idx_t WriteUUIDValue(avro_value_t *target, const cxx::uuid_t &value, uint8_t) {
+idx_t WriteUUIDValue(avro_value_t *target, const cxx::uuid_t &value, uint32_t) {
 	auto bytes = value.Decode();
 	avro_value_set_fixed(target, bytes.bytes, sizeof(bytes.bytes));
 	return sizeof(bytes.bytes);
 }
 
 template <class T>
-idx_t WriteDecimalValue(avro_value_t *target, const T &value, uint8_t width) {
+idx_t WriteDecimalValue(avro_value_t *target, const T &value, uint32_t width) {
 	uint8_t bytes[16];
 	auto byte_count = WriteDecimalAsFixedBytes<T>(value, bytes, width);
 	avro_value_set_fixed(target, bytes, byte_count);
 	return byte_count;
 }
+
+//! Writes a DECIMAL of more than 38 digits, which DuckDB stores as a BIGNUM, as the big-endian two's complement
+//! bytes its precision requires
+class WideDecimalAvroColumnWriter : public AvroColumnWriter {
+public:
+	WideDecimalAvroColumnWriter(std::string type_name, uint32_t decimal_width)
+	    : AvroColumnWriter(std::move(type_name)), bytes(MinBytesRequiredForDecimal(decimal_width)) {
+	}
+
+	void Prepare(const Vector &vector) override {
+		view = vector.GetView();
+	}
+
+	idx_t Write(avro_value_t *target, idx_t row) override {
+		auto idx = view.SelAt(row);
+		if (!view.RowIsValid(idx)) {
+			return WriteNull(target);
+		}
+		auto value = view.Data<cxx::bignum_t>()[idx].Decode();
+		// the fixed has room for the sign bit of every value of the precision
+		if (value.magnitude.size() > bytes.size()) {
+			throw InvalidInputError("DECIMAL value of " + std::to_string(value.magnitude.size()) +
+			                        " bytes does not fit the " + std::to_string(bytes.size()) +
+			                        " bytes of the Avro fixed of \"" + type_name + "\"");
+		}
+		auto padding = bytes.size() - value.magnitude.size();
+		memset(bytes.data(), 0, padding);
+		memcpy(bytes.data() + padding, value.magnitude.data(), value.magnitude.size());
+		if (value.is_negative) {
+			// two's complement: invert the bytes and add one
+			bool carry = true;
+			for (idx_t i = bytes.size(); i > 0; i--) {
+				auto inverted = static_cast<uint8_t>(~bytes[i - 1]);
+				bytes[i - 1] = carry ? static_cast<uint8_t>(inverted + 1) : inverted;
+				carry = carry && bytes[i - 1] == 0;
+			}
+		}
+		avro_value_set_fixed(GetNonNullTarget(target), bytes.data(), bytes.size());
+		return bytes.size();
+	}
+
+private:
+	//! The bytes of the value being written, reused for every row
+	std::vector<uint8_t> bytes;
+	cxx::VectorView view {};
+};
 
 class NullAvroColumnWriter : public AvroColumnWriter {
 public:
@@ -930,6 +928,8 @@ writer_ptr_t CreateAvroColumnWriter(const LogicalType &type) {
 		case LogicalTypeId::HUGEINT:
 			return std::make_unique<PrimitiveAvroColumnWriter<cxx::int128_t>>(type_name,
 			                                                                  WriteDecimalValue<cxx::int128_t>, width);
+		case LogicalTypeId::BIGNUM:
+			return std::make_unique<WideDecimalAvroColumnWriter>(type_name, width);
 		default:
 			throw NotImplementedError("Unsupported decimal physical type");
 		}

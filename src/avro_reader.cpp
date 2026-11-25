@@ -245,6 +245,131 @@ private:
 	avro_type_t avro_type;
 };
 
+//! The big-endian bytes of 10^exponent, without leading zeroes
+std::vector<uint8_t> PowerOfTen(uint32_t exponent) {
+	// little-endian limbs of 32 bits, multiplied by up to nine digits at a time
+	std::vector<uint32_t> limbs {1};
+	while (exponent > 0) {
+		uint32_t factor = 1;
+		for (idx_t i = 0; i < 9 && exponent > 0; i++, exponent--) {
+			factor *= 10;
+		}
+		uint64_t carry = 0;
+		for (auto &limb : limbs) {
+			auto product = static_cast<uint64_t>(limb) * factor + carry;
+			limb = static_cast<uint32_t>(product);
+			carry = product >> 32;
+		}
+		if (carry) {
+			limbs.push_back(static_cast<uint32_t>(carry));
+		}
+	}
+	std::vector<uint8_t> result;
+	result.reserve(limbs.size() * 4);
+	for (idx_t i = limbs.size(); i > 0; i--) {
+		for (idx_t shift = 32; shift > 0; shift -= 8) {
+			auto byte = static_cast<uint8_t>(limbs[i - 1] >> (shift - 8));
+			if (byte || !result.empty()) {
+				result.push_back(byte);
+			}
+		}
+	}
+	return result;
+}
+
+//! Reads a decimal of more than 38 digits, which DuckDB stores as a BIGNUM, from big-endian two's complement bytes
+class WideDecimalReader : public PrimitiveReader<cxx::blob_t> {
+public:
+	WideDecimalReader(avro_type_t avro_type, uint32_t width, uint32_t scale)
+	    : avro_type(avro_type), width(width), scale(scale), limit_size((BitsRequiredForDecimal(width) + 7) / 8) {
+	}
+
+	void Refresh() override {
+		PrimitiveReader::Refresh();
+		heap.emplace(vector->GetHeap());
+	}
+
+	void Read(avro_value_t *value, idx_t row) override {
+		if (avro_type == AVRO_BYTES) {
+			avro_wrapped_buffer bytes_buf = AVRO_WRAPPED_BUFFER_EMPTY;
+			if (avro_value_grab_bytes(value, &bytes_buf)) {
+				throw AvroError();
+			}
+			try {
+				ReadBytes(static_cast<const uint8_t *>(bytes_buf.buf), bytes_buf.size, row);
+			} catch (...) {
+				bytes_buf.free(&bytes_buf);
+				throw;
+			}
+			bytes_buf.free(&bytes_buf);
+			return;
+		}
+		const void *ptr;
+		size_t bytes_size;
+		if (avro_value_get_fixed(value, &ptr, &bytes_size)) {
+			throw AvroError();
+		}
+		ReadBytes(static_cast<const uint8_t *>(ptr), bytes_size, row);
+	}
+
+private:
+	void ReadBytes(const uint8_t *raw, idx_t size, idx_t row) {
+		decoded.is_negative = size > 0 && (raw[0] & 0x80);
+		// skip the sign extension: the magnitude has no leading zeroes
+		uint8_t sign_extension = decoded.is_negative ? 0xFF : 0x00;
+		idx_t start = 0;
+		while (start < size && raw[start] == sign_extension) {
+			start++;
+		}
+		auto &magnitude = decoded.magnitude;
+		magnitude.assign(raw + start, raw + size);
+		if (decoded.is_negative) {
+			// two's complement: invert the bytes and add one
+			bool carry = true;
+			for (idx_t i = magnitude.size(); i > 0; i--) {
+				auto inverted = static_cast<uint8_t>(~magnitude[i - 1]);
+				magnitude[i - 1] = carry ? static_cast<uint8_t>(inverted + 1) : inverted;
+				carry = carry && magnitude[i - 1] == 0;
+			}
+			if (carry) {
+				// the bytes after the sign extension were all zero: -(256^n), or -1 without any byte left
+				magnitude.insert(magnitude.begin(), 1);
+			}
+		} else if (magnitude.empty()) {
+			magnitude.push_back(0);
+		}
+		if (!FitsWidth(magnitude)) {
+			throw InvalidInputError("Avro decimal value does not fit in DECIMAL(" + std::to_string(width) + "," +
+			                        std::to_string(scale) + ")");
+		}
+		auto encoded = cxx::bignum_t::Encode(decoded);
+		data[row] = heap->AddBlob(std::string_view(reinterpret_cast<const char *>(encoded.data()), encoded.size()));
+	}
+
+	//! Whether the magnitude is below 10^width
+	bool FitsWidth(const std::vector<uint8_t> &magnitude) {
+		if (magnitude.size() != limit_size) {
+			return magnitude.size() < limit_size;
+		}
+		// only values this close to the limit need the limit itself
+		if (limit.empty()) {
+			limit = PowerOfTen(width);
+		}
+		return memcmp(magnitude.data(), limit.data(), limit_size) < 0;
+	}
+
+private:
+	avro_type_t avro_type;
+	uint32_t width;
+	uint32_t scale;
+	//! The size in bytes of 10^width, and 10^width itself once a value needed it
+	idx_t limit_size;
+	std::vector<uint8_t> limit;
+	//! The value being read, reused for every row
+	cxx::bignum_t::Decoded decoded;
+	std::optional<cxx::Arena> heap;
+};
+
 class BlobReader : public PrimitiveReader<cxx::blob_t> {
 public:
 	explicit BlobReader(avro_type_t avro_type) : avro_type(avro_type) {
@@ -662,6 +787,9 @@ reader_ptr_t CreateReader(const AvroType &avro_type, const AvroColumn &column) {
 			return std::make_unique<DecimalReader<int64_t>>(avro_type.avro_type);
 		case LogicalTypeId::HUGEINT:
 			return std::make_unique<DecimalReader<cxx::int128_t>>(avro_type.avro_type);
+		case LogicalTypeId::BIGNUM:
+			return std::make_unique<WideDecimalReader>(avro_type.avro_type, column.type.GetDecimalWidth(),
+			                                           column.type.GetDecimalScale());
 		default:
 			throw NotImplementedError("Unsupported decimal physical type");
 		}

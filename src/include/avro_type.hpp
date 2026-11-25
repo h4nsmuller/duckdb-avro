@@ -50,8 +50,8 @@ public:
 	int32_t field_id = std::numeric_limits<int32_t>::max();
 	bool is_timestamp_millis = false;
 	//! DECIMAL parameters
-	uint8_t decimal_width = 0;
-	uint8_t decimal_scale = 0;
+	uint32_t decimal_width = 0;
+	uint32_t decimal_scale = 0;
 	//! ENUM symbols
 	std::vector<std::string> enum_symbols;
 };
@@ -67,6 +67,14 @@ struct AvroColumn {
 	std::vector<AvroColumn> children;
 	std::optional<int32_t> field_id;
 };
+
+//! The number of bits of the largest unscaled value of a DECIMAL of the given precision, without the sign bit:
+//! ceil(precision * log2(10))
+uint64_t BitsRequiredForDecimal(uint32_t precision);
+
+//! The size of the smallest two's complement integer that holds every unscaled value of a DECIMAL of the given
+//! precision, which is the size of the Avro fixed it is written as
+uint32_t MinBytesRequiredForDecimal(uint32_t precision);
 
 //! Converts an Avro schema into the type tree it is read with
 AvroType TransformSchema(avro_schema_t avro_schema, std::unordered_set<std::string> parent_schema_names);
